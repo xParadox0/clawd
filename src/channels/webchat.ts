@@ -23,8 +23,6 @@ export class WebChatChannel implements ChannelAdapter {
     const app = express();
     this.httpServer = createServer(app);
     this.io = new IOServer(this.httpServer, { cors: { origin: '*' } });
-
-    // Serve webchat static files from webchat/ folder (two levels up from dist/channels/)
     const webDir = join(__dirname, '..', '..', 'webchat');
     app.use(express.static(webDir));
 
@@ -32,10 +30,7 @@ export class WebChatChannel implements ChannelAdapter {
       const sessionId = randomUUID();
       const name = (socket.handshake.query.name as string) || 'User';
       this.sessions.set(sessionId, { socket, sessionId, name });
-
-      // Send history for this session
       socket.emit('history', getHistory('webchat', sessionId));
-
       socket.on('message', (text: string) => {
         if (typeof text !== 'string' || !text.trim()) return;
         insertMessage({
@@ -47,7 +42,6 @@ export class WebChatChannel implements ChannelAdapter {
         socket.emit('ack', { ok: true });
         process.stderr.write(`[CLAWD] WebChat message from ${name}: ${text.trim()}\n`);
       });
-
       socket.on('disconnect', () => this.sessions.delete(sessionId));
     });
 

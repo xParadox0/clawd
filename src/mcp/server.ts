@@ -5,10 +5,25 @@ import { getPendingMessages, getConversations, getHistory } from '../store/db.js
 import type { ChannelAdapter } from '../types.js';
 import type { WebChatChannel } from '../channels/webchat.js';
 
+const ADMIN = 'http://127.0.0.1:18791';
+
+async function adminGet(path: string): Promise<any> {
+  const res = await fetch(`${ADMIN}${path}`);
+  return res.json();
+}
+
+async function adminSend(channel: string, contactId: string, message: string): Promise<any> {
+  const res = await fetch(`${ADMIN}/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel, contactId, message }),
+  });
+  return res.json();
+}
+
 export async function startMcpServer(adapters: ChannelAdapter[]): Promise<void> {
   const server = new McpServer({ name: 'clawd', version: '1.0.0' });
-  const adapterMap = new Map(adapters.map(a => [a.name, a]));
-  const webchat = adapterMap.get('webchat') as WebChatChannel | undefined;
+  const webchat = adapters.find(a => a.name === 'webchat') as WebChatChannel | undefined;
 
   server.tool(
     'clawd_get_pending_messages',
@@ -37,10 +52,12 @@ export async function startMcpServer(adapters: ChannelAdapter[]): Promise<void> 
       message:   z.string(),
     },
     async ({ channel, contactId, message }) => {
-      const adapter = adapterMap.get(channel);
-      if (!adapter) return { content: [{ type: 'text', text: `Channel "${channel}" not enabled.` }] };
-      const r = await adapter.send(contactId, message);
-      return { content: [{ type: 'text', text: r.ok ? `✓ Sent on ${channel} to ${contactId}` : `✗ Failed: ${r.error}` }] };
+      try {
+        const r = await adminSend(channel, contactId, message);
+        return { content: [{ type: 'text', text: r.ok ? `✓ Sent on ${channel} to ${contactId}` : `✗ Failed: ${r.error}` }] };
+      } catch (e: any) {
+        return { content: [{ type: 'text', text: `✗ Admin API error: ${e.message}` }] };
+      }
     }
   );
 
@@ -88,15 +105,21 @@ export async function startMcpServer(adapters: ChannelAdapter[]): Promise<void> 
     'clawd_get_status',
     'Check connection status of all messaging channels.',
     {},
-    async () => ({
-      content: [{
-        type: 'text',
-        text: adapters.map(a => {
-          const s = a.getStatus();
-          return `${s.channel.toUpperCase()}: ${s.connected ? '✓ Connected' : '✗ Disconnected'} — ${s.detail}`;
-        }).join('\n')
-      }]
-    })
+    async () => {
+      try {
+        const statuses = await adminGet('/status');
+        return {
+          content: [{
+            type: 'text',
+            text: statuses.map((s: any) =>
+              `${s.channel.toUpperCase()}: ${s.connected ? '✓ Connected' : '✗ Disconnected'} — ${s.detail}`
+            ).join('\n')
+          }]
+        };
+      } catch {
+        return { content: [{ type: 'text', text: adapters.map(a => { const s = a.getStatus(); return `${s.channel.toUpperCase()}: ${s.connected ? '✓' : '✗'} ${s.detail}`; }).join('\n') }] };
+      }
+    }
   );
 
   server.tool(
