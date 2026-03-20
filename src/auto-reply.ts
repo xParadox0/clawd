@@ -5,7 +5,7 @@ import { join } from 'path';
 
 const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
 
-// ── Token resolution ────────────────────────────────────────────────────────
+// ── Token resolution — re-reads from disk every call so refresh is picked up ─
 function resolveToken(): string {
   if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
   const credPaths = [
@@ -25,41 +25,80 @@ function resolveToken(): string {
 
 // ── Conversation memory (last 40 messages = 20 turns) ──────────────────────
 const memory = new Map<string, Array<{ role: string; content: string }>>();
-
 function getMemory(key: string) {
   if (!memory.has(key)) memory.set(key, []);
   return memory.get(key)!;
 }
-
 function pushMemory(key: string, role: 'user' | 'assistant', content: string) {
   const mem = getMemory(key);
   mem.push({ role, content });
   if (mem.length > 40) mem.splice(0, mem.length - 40);
 }
 
-// ── Claude API call ─────────────────────────────────────────────────────────
+// ── Claude API call with retry ──────────────────────────────────────────────
 async function callClaude(
   system: string,
   messages: Array<{ role: string; content: string }>,
-  token: string
 ): Promise<string> {
-  const res = await fetch(ANTHROPIC_API, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': token,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
-      system,
-      messages,
-    }),
-  });
-  if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${await res.text()}`);
-  const data = await res.json() as any;
-  return (data.content?.[0]?.text ?? '').trim() || '(no response)';
+  const maxRetries = 3;
+  const delays = [2000, 5000, 10000]; // 2s, 5s, 10s backoff
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const token = resolveToken(); // fresh token each attempt
+    if (!token) throw new Error('No auth token found — log in to Claude Code or set ANTHROPIC_API_KEY');
+
+    const res = await fetch(ANTHROPIC_API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': token,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1024,
+        system,
+        messages,
+      }),
+    });
+
+    // Success
+    if (res.ok) {
+      const data = await res.json() as any;
+      return (data.content?.[0]?.text ?? '').trim() || '(no response)';
+    }
+
+    const body = await res.text();
+
+    // 401 — token expired, re-read on next attempt (already done above)
+    if (res.status === 401) {
+      process.stderr.write(`[CLAWD] Auth error (attempt ${attempt + 1}/${maxRetries + 1}) — token may have expired, retrying...\n`);
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, delays[attempt]));
+        continue;
+      }
+      throw new Error(`Auth failed after ${maxRetries + 1} attempts — please re-login to Claude Code: claude /login`);
+    }
+
+    // 429 — rate limited
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get('retry-after') ?? '30', 10) * 1000;
+      process.stderr.write(`[CLAWD] Rate limited, waiting ${retryAfter / 1000}s...\n`);
+      await new Promise(r => setTimeout(r, retryAfter));
+      continue;
+    }
+
+    // 5xx — transient server error, retry
+    if (res.status >= 500 && attempt < maxRetries) {
+      process.stderr.write(`[CLAWD] API server error ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delays[attempt] / 1000}s...\n`);
+      await new Promise(r => setTimeout(r, delays[attempt]));
+      continue;
+    }
+
+    throw new Error(`Anthropic API ${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  throw new Error('Max retries exceeded');
 }
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -76,7 +115,6 @@ type PendingReply = {
 };
 
 export class AutoReplyEngine {
-  private token: string;
   private system: string;
   private adapters: Map<string, ChannelAdapter>;
   private active: boolean;
@@ -84,7 +122,6 @@ export class AutoReplyEngine {
   private pending = new Map<string, PendingReply>();
 
   constructor(opts: { systemPrompt?: string; adapters: ChannelAdapter[]; delayMs?: number }) {
-    this.token = resolveToken();
     this.adapters = new Map(opts.adapters.map(a => [a.name, a]));
     this.delayMs = opts.delayMs ?? parseInt(process.env.CLAWD_REPLY_DELAY_MS ?? '300000', 10);
     this.system = opts.systemPrompt ?? [
@@ -93,11 +130,13 @@ export class AutoReplyEngine {
       'Reply concisely and naturally.',
       'Support Bahasa Indonesia and English — reply in the same language the user writes in.',
     ].join(' ');
-    this.active = !!this.token;
-    if (this.token) {
+
+    const hasToken = !!resolveToken();
+    this.active = hasToken;
+    if (hasToken) {
       process.stderr.write(`[CLAWD] Auto-reply engine ready (delay: ${Math.round(this.delayMs / 60000)} min).\n`);
     } else {
-      process.stderr.write('[CLAWD] Auto-reply disabled — no token found.\n');
+      process.stderr.write('[CLAWD] Auto-reply disabled — no token found. Log in to Claude Code or set ANTHROPIC_API_KEY.\n');
     }
   }
 
@@ -106,13 +145,12 @@ export class AutoReplyEngine {
   }
 
   async handleInbound(msg: InboundMessage): Promise<void> {
-    if (!this.active || !this.token) return;
+    if (!this.active) return;
 
     markRead([msg.id]);
     const memKey = `${msg.channel}:${msg.contactId}`;
     pushMemory(memKey, 'user', msg.content);
 
-    // Reset timer if already pending for this conversation
     const existing = this.pending.get(memKey);
     if (existing) {
       clearTimeout(existing.timer);
@@ -146,7 +184,7 @@ export class AutoReplyEngine {
 
     process.stderr.write(`[CLAWD] Auto-reply firing → ${msg.contactName} [${msg.channel}]: "${msg.content}"\n`);
     try {
-      const reply = await callClaude(this.system, getMemory(memKey), resolveToken());
+      const reply = await callClaude(this.system, getMemory(memKey));
       pushMemory(memKey, 'assistant', reply);
       const result = await adapter.send(msg.contactId, reply);
       if (result.ok) {
@@ -155,7 +193,7 @@ export class AutoReplyEngine {
         process.stderr.write(`[CLAWD] Send failed: ${result.error}\n`);
       }
     } catch (e: any) {
-      process.stderr.write(`[CLAWD] Auto-reply error: ${e.message}\n`);
+      process.stderr.write(`[CLAWD] Auto-reply FAILED for ${msg.contactName}: ${e.message}\n`);
     }
   }
 
@@ -169,7 +207,7 @@ export class AutoReplyEngine {
   }
 
   resume(): void {
-    this.active = !!this.token;
+    this.active = !!resolveToken();
     process.stderr.write('[CLAWD] Auto-reply resumed.\n');
   }
 
