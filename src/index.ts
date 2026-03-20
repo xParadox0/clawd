@@ -11,17 +11,18 @@ import type { ChannelAdapter } from './types.js';
 async function main() {
   process.stderr.write('[CLAWD] Starting...\n');
 
-  // ── Auto-reply engine — resolves token automatically from claude.ai OAuth ──
+  const delayMs = parseInt(process.env.CLAWD_REPLY_DELAY_MS ?? '300000', 10);
+
   const autoReply = new AutoReplyEngine({
     systemPrompt: process.env.CLAWD_SYSTEM_PROMPT,
     adapters: [],
+    delayMs,
   });
 
   const onMsg = autoReply.isActive()
     ? (m: any) => autoReply.handleInbound(m)
     : undefined;
 
-  // ── Channels ───────────────────────────────────────────────────────────────
   const wa = new WhatsAppChannel({ onMessage: onMsg });
   const tg = new TelegramChannel(process.env.TELEGRAM_BOT_TOKEN ?? '', { onMessage: onMsg });
   const wc = new WebChatChannel(parseInt(process.env.WEBCHAT_PORT ?? '18790', 10), { onMessage: onMsg });
@@ -46,6 +47,8 @@ async function main() {
       res.end(JSON.stringify({
         channels: adapters.map(a => a.getStatus()),
         autoReply: autoReply.isActive(),
+        pendingReplies: autoReply.pendingCount(),
+        replyDelayMs: delayMs,
       }));
       return;
     }
@@ -73,6 +76,8 @@ async function main() {
             res.end(JSON.stringify({ ok: false, error: `Unknown channel: ${channel}` }));
             return;
           }
+          // Cancel pending auto-reply since you're replying manually
+          autoReply.cancelPending(channel, contactId);
           res.end(JSON.stringify(await adapter.send(contactId, message)));
         } catch (e: any) {
           res.statusCode = 400;
@@ -83,13 +88,11 @@ async function main() {
     }
     if (req.method === 'POST' && url.pathname === '/autoreply/disable') {
       autoReply.stop();
-      res.end(JSON.stringify({ ok: true, autoReply: false }));
-      return;
+      res.end(JSON.stringify({ ok: true, autoReply: false })); return;
     }
     if (req.method === 'POST' && url.pathname === '/autoreply/enable') {
       autoReply.resume();
-      res.end(JSON.stringify({ ok: true, autoReply: autoReply.isActive() }));
-      return;
+      res.end(JSON.stringify({ ok: true, autoReply: autoReply.isActive() })); return;
     }
     res.statusCode = 404;
     res.end(JSON.stringify({ error: 'Not found' }));
