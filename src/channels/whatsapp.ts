@@ -8,6 +8,7 @@ import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { insertMessage, AUTH_DIR } from '../store/db.js';
 import type { ChannelAdapter, ChannelStatus, SendResult } from '../types.js';
+import type { InboundMessage } from '../auto-reply.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -16,6 +17,11 @@ export class WhatsAppChannel implements ChannelAdapter {
   private sock: ReturnType<typeof makeWASocket> | null = null;
   private status: ChannelStatus = { channel: 'whatsapp', connected: false, detail: 'Not started' };
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private onMessage?: (msg: InboundMessage) => void;
+
+  constructor(opts?: { onMessage?: (msg: InboundMessage) => void }) {
+    this.onMessage = opts?.onMessage;
+  }
 
   async connect(): Promise<void> { await this._start(); }
 
@@ -35,10 +41,10 @@ export class WhatsAppChannel implements ChannelAdapter {
     this.sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
       if (qr) {
         this.status = { channel: 'whatsapp', connected: false, detail: 'Scan QR in terminal' };
-        process.stderr.write('\n[CLAWD] ======= WHATSAPP QR CODE =======\n');
-        process.stderr.write('[CLAWD] Scan with: WhatsApp > Settings > Linked Devices > Link a Device\n\n');
+        process.stderr.write('\n[CLAWD] ======= WHATSAPP QR =======\n');
+        process.stderr.write('[CLAWD] WhatsApp > Settings > Linked Devices > Link a Device\n\n');
         qrcode.generate(qr, { small: true });
-        process.stderr.write('\n[CLAWD] =====================================\n\n');
+        process.stderr.write('\n[CLAWD] ==================================\n\n');
       }
       if (connection === 'open') {
         this.status = { channel: 'whatsapp', connected: true, detail: 'Connected' };
@@ -49,10 +55,8 @@ export class WhatsAppChannel implements ChannelAdapter {
         const retry = code !== DisconnectReason.loggedOut;
         this.status = { channel: 'whatsapp', connected: false, detail: retry ? 'Reconnecting...' : 'Logged out' };
         if (retry) {
-          process.stderr.write('[CLAWD] WhatsApp disconnected, reconnecting in 5s...\n');
+          process.stderr.write('[CLAWD] WhatsApp reconnecting in 5s...\n');
           this.retryTimer = setTimeout(() => this._start(), 5000);
-        } else {
-          process.stderr.write('[CLAWD] WhatsApp logged out.\n');
         }
       }
     });
@@ -66,13 +70,14 @@ export class WhatsAppChannel implements ChannelAdapter {
           || msg.message.extendedTextMessage?.text
           || msg.message.imageMessage?.caption
           || '[media]';
-        insertMessage({
-          id: msg.key.id ?? randomUUID(), channel: 'whatsapp',
-          contactId: jid, contactName: msg.pushName ?? jid.split('@')[0],
-          content: text, timestamp: (msg.messageTimestamp as number) * 1000,
-          direction: 'inbound', read: false,
-        });
-        process.stderr.write(`[CLAWD] WhatsApp message from ${msg.pushName ?? jid}: ${text}\n`);
+        const name = msg.pushName ?? jid.split('@')[0];
+        const id   = msg.key.id ?? randomUUID();
+        const ts   = (msg.messageTimestamp as number) * 1000;
+
+        insertMessage({ id, channel: 'whatsapp', contactId: jid, contactName: name, content: text, timestamp: ts, direction: 'inbound', read: false });
+        process.stderr.write(`[CLAWD] WhatsApp from ${name}: ${text}\n`);
+
+        this.onMessage?.({ id, channel: 'whatsapp', contactId: jid, contactName: name, content: text, timestamp: ts });
       }
     });
   }
@@ -83,11 +88,7 @@ export class WhatsAppChannel implements ChannelAdapter {
       const jid  = contactId.includes('@') ? contactId : `${contactId}@s.whatsapp.net`;
       const sent = await this.sock.sendMessage(jid, { text });
       const msgId = sent?.key.id ?? undefined;
-      insertMessage({
-        id: msgId ?? randomUUID(), channel: 'whatsapp',
-        contactId: jid, contactName: jid.split('@')[0],
-        content: text, timestamp: Date.now(), direction: 'outbound', read: true,
-      });
+      insertMessage({ id: msgId ?? randomUUID(), channel: 'whatsapp', contactId: jid, contactName: jid.split('@')[0], content: text, timestamp: Date.now(), direction: 'outbound', read: true });
       return { ok: true, messageId: msgId };
     } catch (e: any) { return { ok: false, error: e.message }; }
   }

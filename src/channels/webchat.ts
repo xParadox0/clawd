@@ -6,6 +6,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { insertMessage, getHistory } from '../store/db.js';
 import type { ChannelAdapter, ChannelStatus, SendResult } from '../types.js';
+import type { InboundMessage } from '../auto-reply.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 type Session = { socket: Socket; sessionId: string; name: string };
@@ -16,8 +17,11 @@ export class WebChatChannel implements ChannelAdapter {
   private io: IOServer | null = null;
   private sessions = new Map<string, Session>();
   private status: ChannelStatus = { channel: 'webchat', connected: false, detail: 'Not started' };
+  private onMessage?: (msg: InboundMessage) => void;
 
-  constructor(private port = 18790) {}
+  constructor(private port = 18790, opts?: { onMessage?: (msg: InboundMessage) => void }) {
+    this.onMessage = opts?.onMessage;
+  }
 
   async connect(): Promise<void> {
     const app = express();
@@ -31,17 +35,17 @@ export class WebChatChannel implements ChannelAdapter {
       const name = (socket.handshake.query.name as string) || 'User';
       this.sessions.set(sessionId, { socket, sessionId, name });
       socket.emit('history', getHistory('webchat', sessionId));
+
       socket.on('message', (text: string) => {
         if (typeof text !== 'string' || !text.trim()) return;
-        insertMessage({
-          id: randomUUID(), channel: 'webchat',
-          contactId: sessionId, contactName: name,
-          content: text.trim(), timestamp: Date.now(),
-          direction: 'inbound', read: false,
-        });
+        const id = randomUUID();
+        const ts = Date.now();
+        insertMessage({ id, channel: 'webchat', contactId: sessionId, contactName: name, content: text.trim(), timestamp: ts, direction: 'inbound', read: false });
         socket.emit('ack', { ok: true });
-        process.stderr.write(`[CLAWD] WebChat message from ${name}: ${text.trim()}\n`);
+        process.stderr.write(`[CLAWD] WebChat from ${name}: ${text.trim()}\n`);
+        this.onMessage?.({ id, channel: 'webchat', contactId: sessionId, contactName: name, content: text.trim(), timestamp: ts });
       });
+
       socket.on('disconnect', () => this.sessions.delete(sessionId));
     });
 
@@ -56,10 +60,7 @@ export class WebChatChannel implements ChannelAdapter {
 
   async send(contactId: string, text: string): Promise<SendResult> {
     const id = randomUUID();
-    insertMessage({
-      id, channel: 'webchat', contactId, contactName: 'Clawd',
-      content: text, timestamp: Date.now(), direction: 'outbound', read: true,
-    });
+    insertMessage({ id, channel: 'webchat', contactId, contactName: 'Clawd', content: text, timestamp: Date.now(), direction: 'outbound', read: true });
     this.sessions.get(contactId)?.socket.emit('bot_message', { content: text, timestamp: Date.now() });
     return { ok: true, messageId: id };
   }
